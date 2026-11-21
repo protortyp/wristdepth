@@ -1,7 +1,11 @@
 # WristDepth
 
+![WristDepth on an SO-101 wrist camera: RGB left of the slider, predicted depth right](assets/wristdepth_slider_center.png)
+
+<sub>[Video](https://huggingface.co/christianengel/WristDepth/blob/main/assets/wristdepth_slider.mp4) (made with [`assets/make_slider_video.py`](assets/make_slider_video.py)). Source clip: [legalaspro/so101-greenblack-cube-cup-pnp-30hz](https://huggingface.co/datasets/legalaspro/so101-greenblack-cube-cup-pnp-30hz) (Apache-2.0).</sub>
+
 Metric depth for robot wrist cameras. Model: [christianengel/WristDepth](https://huggingface.co/christianengel/WristDepth)
-(PyTorch + ONNX). Data: [christianengel/WristDepth-procedural](https://huggingface.co/datasets/christianengel/WristDepth-procedural). 
+(PyTorch + ONNX). Data: [christianengel/WristDepth-procedural](https://huggingface.co/datasets/christianengel/WristDepth-procedural).
 
 Stock monocular depth models misjudge gripper views by 2-4x; this repo renders procedural wrist-camera data and fine-tunes
 [Depth Pro 2](https://github.com/apple-aiml-research/ml-depth-pro-2) on it, cutting the error
