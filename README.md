@@ -32,6 +32,8 @@ Details, ablations and caveats: [`research_notes/06_pilot_results.md`](research_
    depth shape. `eval_sets.py` scores SO-101, DROID (val/test by scene) and RoboLab.
 5. **Release** (`card/`): export with [depthpro2-onnx](https://github.com/protortyp/depthpro2-onnx)
    (`export_onnx.py --weights`), check parity, stage a model card from the results files.
+6. **Dataset** (`dataset/build_hf.py`): write the renders as Hugging Face Parquet shards
+   (`wrist` and `pinhole` configs, splits by scene).
 
 `twin/`, `synth/` and `real/` hold the first pilot: a Gaussian-splat twin of one desk, MuJoCo
 compositing, and real SO-101 captures with kinematic ground truth. The twin overfits to its
