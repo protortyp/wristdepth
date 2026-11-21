@@ -1,0 +1,23 @@
+[project]
+name = "wristdepth"
+version = "0.1.0"
+description = "Procedural wrist-camera data and fine-tuning of Depth Pro 2 for metric depth on robot grippers"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+  "numpy",
+  "pillow",
+  "opencv-python-headless",
+]
+
+[project.optional-dependencies]
+# Training and evaluation. The --weights export path lives in depthpro2-onnx.
+train = [
+  "torch",
+  "depthpro2-onnx @ git+https://github.com/protortyp/depthpro2-onnx",
+]
+# Kinematics, gripper fitting and the SO-101 pipeline.
+robot = ["mujoco>=3.3", "scipy"]
+
+[tool.ruff]
+line-length = 100

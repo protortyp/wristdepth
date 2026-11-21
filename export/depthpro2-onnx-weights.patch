@@ -1,0 +1,149 @@
+diff --git a/depthpro2_onnx/model.py b/depthpro2_onnx/model.py
+index d243c32..3aca456 100644
+--- a/depthpro2_onnx/model.py
++++ b/depthpro2_onnx/model.py
+@@ -6,6 +6,8 @@
+ 
+ from __future__ import annotations
+ 
++from pathlib import Path
++
+ import torch
+ from depth_pro_2 import DepthPro2
+ from depth_pro_2.model import IMAGENET_MEAN, IMAGENET_STD, INPUT_MULTIPLE
+@@ -29,13 +31,22 @@ FP32_ATTENTION_BLOCKS = (0,)
+ 
+ 
+ def load_model(
+-    size: str, device: str | torch.device = "cpu", precision: torch.dtype = torch.float32
++    size: str,
++    device: str | torch.device = "cpu",
++    precision: torch.dtype = torch.float32,
++    weights: str | Path | None = None,
+ ) -> DepthPro2:
+-    """Depth Pro 2 ``size`` ("S" or "B") without the field-of-view network, in eval mode."""
++    """Depth Pro 2 ``size`` ("S" or "B") without the field-of-view network, in eval mode.
++
++    ``weights`` is an optional fine-tuned state dict for the same architecture.
++    """
+     repo, revision = CHECKPOINTS[size]
+     model = DepthPro2.from_pretrained(repo, revision=revision, precision=precision)
+     if model.fov is not None:
+         raise RuntimeError(f"{repo}@{revision} unexpectedly bundles the focal-length network.")
++    if weights is not None:
++        state = torch.load(weights, map_location="cpu")
++        model.load_state_dict({k: v.to(precision) for k, v in state.items()})
+     return model.to(device).eval()
+ 
+ 
+diff --git a/export_onnx.py b/export_onnx.py
+index 31f72cf..0297b58 100644
+--- a/export_onnx.py
++++ b/export_onnx.py
+@@ -11,6 +11,7 @@ Writes, for one static input size:
+ from __future__ import annotations
+ 
+ import argparse
++import hashlib
+ import json
+ import shutil
+ import subprocess
+@@ -133,6 +134,7 @@ def main() -> None:
+     parser.add_argument("--stream", type=int, nargs="*", default=[4], help="stream windows W")
+     parser.add_argument("--out", type=Path, required=True)
+     parser.add_argument("--only", nargs="*", default=None, help="export only these file stems")
++    parser.add_argument("--weights", type=Path, help="fine-tuned state dict for --size")
+     args = parser.parse_args()
+     check_size(args.height, args.width)
+     device = "cuda" if torch.cuda.is_available() else "cpu"
+@@ -147,6 +149,8 @@ def main() -> None:
+         "exporter_commit": git_commit(),
+         "opset": OPSET,
+     }
++    if args.weights:
++        base_meta["weights_sha256"] = hashlib.sha256(args.weights.read_bytes()).hexdigest()
+     pixels = lambda t: torch.rand(t, 3, args.height, args.width, device=device)  # noqa: E731
+     f_px = torch.tensor([500.0], device=device)
+ 
+@@ -160,7 +164,7 @@ def main() -> None:
+             name = stem if precision == "fp32" else f"{stem}_fp16"
+             if args.only is not None and name not in args.only:
+                 continue
+-            model = load_model(args.size, device)
++            model = load_model(args.size, device, weights=args.weights)
+             if precision == "fp16":
+                 model = to_fp16(model)
+             meta = base_meta | {"mode": mode, "precision": precision}
+diff --git a/fixtures/make_fixture.py b/fixtures/make_fixture.py
+index 78f4b08..e0f9eb7 100644
+--- a/fixtures/make_fixture.py
++++ b/fixtures/make_fixture.py
+@@ -91,6 +91,7 @@ def estimate_focal(frames: torch.Tensor) -> float:
+ @torch.no_grad()
+ def reference(
+     size: str,
++    weights: Path | None,
+     inputs: dict[str, torch.Tensor],
+     f_px: torch.Tensor,
+     clips: list[int],
+@@ -103,7 +104,7 @@ def reference(
+     out = {}
+     for name, precision in (("fp32", torch.float32), ("bf16", torch.bfloat16)):
+         device = inputs["clip"].device
+-        model = ClipDepth(load_model(size, device, precision)).to(device).eval()
++        model = ClipDepth(load_model(size, device, precision, weights)).to(device).eval()
+         for key, frames in inputs.items():
+             out[f"{name}/single/{key}"] = torch.cat([model(f[None], f_px) for f in frames])
+         for t in clips:
+@@ -121,6 +122,9 @@ def main() -> None:
+     parser.add_argument("--width", type=int, default=640)
+     parser.add_argument("--clips", type=int, nargs="*", default=[4, 16])
+     parser.add_argument("--windows", type=int, nargs="*", default=[4, 8])
++    parser.add_argument("--weights", type=Path, help="fine-tuned state dict (needs --size)")
++    parser.add_argument("--size", choices=sorted(CHECKPOINTS), help="only this size")
++    parser.add_argument("--name", help="reference file stem, default DepthPro2-SIZE")
+     args = parser.parse_args()
+     torch.backends.cuda.matmul.allow_tf32 = False
+     torch.backends.cudnn.allow_tf32 = False
+@@ -134,11 +138,16 @@ def main() -> None:
+ 
+     refs = ROOT / "ref_outputs"
+     refs.mkdir(exist_ok=True)
+-    for size in CHECKPOINTS:
++    for size in [args.size] if args.size else CHECKPOINTS:
+         arrays = reference(
+-            size, inputs, torch.tensor([f_px], device=device), args.clips, args.windows
++            size,
++            args.weights,
++            inputs,
++            torch.tensor([f_px], device=device),
++            args.clips,
++            args.windows,
+         )
+-        np.savez_compressed(refs / f"DepthPro2-{size}_{tag}.npz", **arrays)
++        np.savez_compressed(refs / f"{args.name or f'DepthPro2-{size}'}_{tag}.npz", **arrays)
+         summary = {k: float(np.median(v[np.isfinite(v)])) for k, v in arrays.items()}
+         print(size, json.dumps(summary, indent=1))
+     print(f"f_px {f_px:.2f} at {tag}")
+diff --git a/verify_parity.py b/verify_parity.py
+index 7843a42..ab7a41d 100644
+--- a/verify_parity.py
++++ b/verify_parity.py
+@@ -57,6 +57,7 @@ def main() -> int:
+     parser.add_argument("--json", type=Path, help="write the results here")
+     parser.add_argument("--size", choices=["S", "B"], help="model size, for TensorRT engines")
+     parser.add_argument("--input", default="480x640", help="HxW, for TensorRT engines")
++    parser.add_argument("--refs", help="reference stem in fixtures/ref_outputs, for fine-tunes")
+     args = parser.parse_args()
+ 
+     graph = load(args.onnx, args.provider)
+@@ -65,7 +66,8 @@ def main() -> int:
+     size = config["base_model"].rsplit("-", 1)[-1] if "base_model" in config else args.size
+     tag = f"{config['height']}x{config['width']}" if "height" in config else args.input
+     fixture = np.load(ROOT / "fixtures" / f"test_clip_{tag}.npz")
+-    refs = np.load(ROOT / "fixtures" / "ref_outputs" / f"DepthPro2-{size}_{tag}.npz")
++    stem = args.refs or f"DepthPro2-{size}"
++    refs = np.load(ROOT / "fixtures" / "ref_outputs" / f"{stem}_{tag}.npz")
+ 
+     report = {
+         "graph": args.onnx.name,
