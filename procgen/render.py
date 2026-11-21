@@ -106,27 +106,64 @@ def revolve(name, profile, segments=48):
 
 
 def dishware(rng, kind):
-    t = rng.uniform(0.003, 0.006)
+    """Revolved dish with a real profile: plates have a foot ring, a well and a rim, bowls a
+    foot and a curved or rolled lip, mugs thick walls. Profiles run outside, then inside."""
+    t = rng.uniform(0.003, 0.007)
     if kind == "plate":
-        r, h = rng.uniform(0.08, 0.14), rng.uniform(0.012, 0.025)
-        prof = [(0, 0), (r * 0.6, 0), (r, h), (r - t, h), (r * 0.6 - t, t), (0, t)]
-    elif kind == "bowl":
-        r, h = rng.uniform(0.05, 0.10), rng.uniform(0.04, 0.08)
+        r, h = rng.uniform(0.08, 0.15), rng.uniform(0.015, 0.035)
+        well, foot = r * rng.uniform(0.5, 0.72), r * rng.uniform(0.35, 0.5)
+        floor_z = max(h * rng.uniform(0.0, 0.4), 0.006)  # well floor, above the foot ring
         prof = [
-            (0, 0),
-            (r * 0.45, 0),
-            (r * 0.85, h * 0.5),
+            (0, 0.004),
+            (foot - 0.004, 0.004),
+            (foot, 0),
+            (foot + 0.003, 0.004),
+            (well, floor_z),
+            (well + (r - well) * 0.35, h * 0.85),
             (r, h),
-            (r - t, h),
-            (r * 0.85 - t, h * 0.5),
-            (r * 0.45 - t, t),
-            (0, t),
+            (r - t, h + t * 0.3),
+            (well + (r - well) * 0.35 - t * 0.5, h * 0.85 + t * 0.5),
+            (well - t, floor_z + t),
+            (0, floor_z + t),
         ]
-    else:  # cup or glass
-        r, h = rng.uniform(0.03, 0.05), rng.uniform(0.07, 0.13)
+    elif kind == "bowl":
+        r, h = rng.uniform(0.05, 0.11), rng.uniform(0.035, 0.10)
+        foot, flare = r * rng.uniform(0.3, 0.5), rng.uniform(0.55, 0.9)
+        lip = (
+            [(r, h), (r + t * 0.4, h + t * 0.5), (r - t, h)]
+            if rng.random() < 0.3
+            else [(r, h), (r - t, h)]
+        )
+        prof = [
+            (0, 0.004),
+            (foot, 0.004),
+            (foot + 0.002, 0),
+            (foot + 0.006, 0.006),
+            (r * flare, h * 0.45),
+            *lip,
+            (r * flare - t, h * 0.45 + t * 0.2),
+            (foot, t + 0.004),
+            (0, t + 0.004),
+        ]
+    else:  # cup, mug or glass
+        r, h = rng.uniform(0.03, 0.05), rng.uniform(0.06, 0.13)
+        t = rng.uniform(0.003, 0.008)
         rb = r * rng.uniform(0.7, 1.0)
         prof = [(0, 0), (rb, 0), (r, h), (r - t, h), (rb - t, t * 2), (0, t * 2)]
     return revolve(kind, prof)
+
+
+def dish_material(rng, cc_dir: Path, cc_names):
+    """Often glazed white or cream: low-texture glossy dishes are where monocular depth fails
+    on real tables (domed plate floors, misplaced rims)."""
+    u = rng.random()
+    if u < 0.45:
+        base = rng.uniform(0.82, 0.97)
+        tint = np.array([1.0, rng.uniform(0.96, 1.0), rng.uniform(0.88, 1.0)])
+        return principled("glaze_white", np.clip(base * tint, 0, 1), rng.uniform(0.02, 0.25))
+    if u < 0.70:
+        return principled("glaze", saturated(rng), rng.uniform(0.03, 0.3))
+    return object_material(rng, cc_dir, cc_names)
 
 
 def cc_material(rng, cc_dir: Path, names):
@@ -341,13 +378,16 @@ def build_scene(rng, args, cc_dir, cc_names, models, hdris):
 
     # A room: walls at random gaps beyond the table edges, so views past the table see
     # labelled surfaces at 0.5-3 m as in real labs, not only the environment map.
+    # walls holds (axis, signed offset) so camera poses can be kept inside the room.
+    walls = []
     for side in range(4):
         if rng.random() < 0.25:
             continue
-        gap = rng.uniform(0.1, 1.5)
+        gap = rng.uniform(0.2, 2.5)
         along_x = side < 2
         sign = 1 if side % 2 == 0 else -1
         offset = (sy / 2 if along_x else sx / 2) + gap
+        walls.append((1 if along_x else 0, sign * offset))
         wall = bproc.object.create_primitive("PLANE", scale=[3, 1.5, 1])
         wall.set_location([0, sign * offset, 0.5] if along_x else [sign * offset, 0, 0.5])
         wall.set_rotation_euler([np.pi / 2, 0, 0] if along_x else [np.pi / 2, 0, np.pi / 2])
@@ -391,9 +431,10 @@ def build_scene(rng, args, cc_dir, cc_names, models, hdris):
             obj.set_cp("haven", m["name"])
             if rng.random() < 0.3:
                 obj.replace_materials(object_material(rng, cc_dir, cc_names))
-        elif u < 0.75:
-            obj = dishware(rng, rng.choice(["plate", "bowl", "cup", "cup"]))
-            obj.replace_materials(object_material(rng, cc_dir, cc_names))
+        elif u < 0.85:
+            obj = dishware(rng, rng.choice(["plate", "plate", "bowl", "bowl", "cup"]))
+            obj.replace_materials(dish_material(rng, cc_dir, cc_names))
+            obj.set_cp("dish", True)
         else:
             kind = rng.choice(["CUBE", "CYLINDER", "SPHERE", "CONE"])
             obj = bproc.object.create_primitive(kind)
@@ -444,7 +485,7 @@ def build_scene(rng, args, cc_dir, cc_names, models, hdris):
     for o in objects:
         if o not in placed:
             o.delete()
-    return table_z, (sx, sy), placed
+    return table_z, (sx, sy), placed, walls
 
 
 def main() -> None:
@@ -494,7 +535,7 @@ def main() -> None:
         if bpy.context.scene.world is None:
             bpy.context.scene.world = bpy.data.worlds.new("World")
         bpy.context.scene.world.use_nodes = True
-        table_z, size, objects = build_scene(rng, args, cc_dir, cc_names, models, hdris)
+        table_z, size, objects, walls = build_scene(rng, args, cc_dir, cc_names, models, hdris)
         spec, parts = load_gripper(args.gripper)
         fmat = pick(rng, FINGER_COLOURS)
         rgb = saturated(rng) if fmat is None else rng.uniform(fmat[0], fmat[1])
@@ -526,10 +567,14 @@ def main() -> None:
         frames = []
         tries = 0
         bands = rng.permutation(len(POSE_BANDS))
+        dishes = [o for o in objects if o.has_cp("dish")]
         while len(frames) < args.frames_per_scene and tries < args.frames_per_scene * 30:
             tries += 1
             if objects and rng.random() < 0.6:
-                c = objects[rng.integers(len(objects))].get_location()[:2] + rng.normal(0, 0.03, 2)
+                # Half of the object views centre a dish, so close-ups into plates and bowls
+                # (rim and floor filling the frame) are common.
+                pool = dishes if dishes and rng.random() < 0.5 else objects
+                c = pool[rng.integers(len(pool))].get_location()[:2] + rng.normal(0, 0.03, 2)
             else:
                 c = np.array(
                     [rng.uniform(-size[0] / 2, size[0] / 2), rng.uniform(-size[1] / 2, size[1] / 2)]
@@ -544,6 +589,10 @@ def main() -> None:
             ):
                 continue
             if any(inside_box(o, T_cv[:3, 3], 0.01) for o in objects):
+                continue
+            # Walls are opaque from behind: a camera outside the room would label a wall
+            # centimetres away as the "far" view.
+            if any(np.sign(w) * T_cv[axis, 3] > abs(w) - 0.05 for axis, w in walls):
                 continue
             frame = len(frames)
             T_gl = bproc.math.change_source_coordinate_frame_of_transformation_matrix(

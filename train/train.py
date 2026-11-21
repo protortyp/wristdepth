@@ -69,13 +69,33 @@ def load_unlabelled(path: Path, max_width: int = 640) -> np.ndarray:
     return np.ascontiguousarray(rgb[top : top + h, left : left + w])
 
 
-def distill_loss(student, teacher):
-    """Scale-invariant log-depth loss: variance of the log ratio plus its gradients."""
+def distill_loss(student, teacher, kind: str = "global"):
+    """Scale-invariant log-depth loss against the frozen base model.
+
+    global: variance of the log ratio plus its gradients; it also copies the base model's
+    near-to-far range, which is compressed on wrist views.
+    grad: multi-scale gradients of the log ratio only, so edges and surfaces are kept while the
+    overall depth range is left to the labelled loss.
+    """
     d = torch.log(student.clamp_min(1e-4)) - torch.log(teacher.clamp_min(1e-4))
-    si = (d - d.mean()).pow(2).mean()
-    gx = (d[..., :, 1:] - d[..., :, :-1]).abs().mean()
-    gy = (d[..., 1:, :] - d[..., :-1, :]).abs().mean()
-    return si + 0.5 * (gx + gy)
+    if kind == "global":
+        si = (d - d.mean()).pow(2).mean()
+        gx = (d[..., :, 1:] - d[..., :, :-1]).abs().mean()
+        gy = (d[..., 1:, :] - d[..., :-1, :]).abs().mean()
+        return si + 0.5 * (gx + gy)
+    # The base model's sky and far background (clamped inverse depth) carry no shape signal.
+    m = ((teacher > 0.03) & (teacher < 10.0)).float()
+    total = 0.0
+    for s in (1, 2, 4, 8):
+        ds = torch.nn.functional.avg_pool2d((d * m)[:, None], s)[:, 0] if s > 1 else d * m
+        ms = torch.nn.functional.avg_pool2d(m[:, None], s)[:, 0] if s > 1 else m
+        ds = ds / ms.clamp_min(1e-6)
+        mx = (ms[..., :, 1:] > 0.99) & (ms[..., :, :-1] > 0.99)
+        my = (ms[..., 1:, :] > 0.99) & (ms[..., :-1, :] > 0.99)
+        gx = (ds[..., :, 1:] - ds[..., :, :-1]).abs()[mx]
+        gy = (ds[..., 1:, :] - ds[..., :-1, :]).abs()[my]
+        total = total + (gx.sum() + gy.sum()) / (mx.sum() + my.sum()).clamp_min(1)
+    return total
 
 
 # Labels outside this range are near-clip gripper slivers or far background; their log error
@@ -92,7 +112,8 @@ def loss_fn(pred, gt, w):
     m = (w > 0.5).float()
     gx = (diff[..., :, 1:] - diff[..., :, :-1]).abs() * m[..., :, 1:] * m[..., :, :-1]
     gy = (diff[..., 1:, :] - diff[..., :-1, :]).abs() * m[..., 1:, :] * m[..., :-1, :]
-    grad = (gx.sum() + gy.sum()) / (m.sum().clamp_min(1))
+    pairs = (m[..., :, 1:] * m[..., :, :-1]).sum() + (m[..., 1:, :] * m[..., :-1, :]).sum()
+    grad = (gx.sum() + gy.sum()) / pairs.clamp_min(1)
     return l1 + 0.5 * grad
 
 
@@ -135,6 +156,12 @@ def main() -> None:
         "--distill-ratio", type=float, default=0.5, help="unlabelled images per synthetic frame"
     )
     ap.add_argument("--distill-weight", type=float, default=1.0)
+    ap.add_argument("--distill-loss", choices=["global", "grad"], default="global")
+    ap.add_argument(
+        "--bf16-weights",
+        action="store_true",
+        help="keep trainable weights in bf16 (AdamW then drops most small updates)",
+    )
     ap.add_argument(
         "--eval-every", type=int, default=0, help="frames between real evaluations (0 = per epoch)"
     )
@@ -178,7 +205,10 @@ def main() -> None:
         teacher = load_model(args.size, device, torch.bfloat16).eval()
         for p in teacher.parameters():
             p.requires_grad = False
-    model = load_model(args.size, device, torch.bfloat16).train()
+    # fp32 master weights: bf16 has an 8-bit mantissa, so at encoder learning rates most
+    # AdamW updates round away. Autocast still runs the forward pass in bf16.
+    weight_dtype = torch.bfloat16 if args.bf16_weights else torch.float32
+    model = load_model(args.size, device, weight_dtype).train()
     if args.init:
         model.load_state_dict(torch.load(args.init, map_location=device))
     for p in model.encoder.parameters():
@@ -275,7 +305,9 @@ def main() -> None:
                     t = predict_depth(teacher, x, f_guess).float()
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     sdep = predict_depth(model, x, f_guess).float()
-                (args.distill_weight * distill_loss(sdep, t) / args.accum).backward()
+                (
+                    args.distill_weight * distill_loss(sdep, t, args.distill_loss) / args.accum
+                ).backward()
             seen += 1
             if args.eval_every and seen % args.eval_every == 0:
                 r = score(f"frame {seen}")
