@@ -20,19 +20,19 @@ import bpy
 import numpy as np
 
 W, H = 640, 480
-FAR = 4.0
+FAR = 6.0
 FINGER, TABLE, OBJECT, BACKGROUND = 1, 2, 3, 4
 
-# Distance along the optical axis to the table (m) and pitch from straight down (deg).
-# The first four components follow SO-101 teleoperation (median ~18 cm); the wide log-uniform
-# share covers other arms and mobile bases (DROID wrist views have a 34 cm median and reach
-# past 1 m) and keeps the network from learning a preferred distance.
-POSE_MIXTURE = [
-    (0.20, ("uniform", 0.06, 0.15), ("normal", 28, 10)),
-    (0.20, ("uniform", 0.15, 0.30), ("normal", 33, 13)),
-    (0.12, ("uniform", 0.30, 0.60), ("normal", 45, 15)),
-    (0.10, ("uniform", 0.50, 1.20), ("uniform", 40, 85)),
-    (0.38, ("loguniform", 0.05, 1.50), ("uniform", 0, 80)),
+# Distance bands along the optical axis to the table (m) with pitch from straight down (deg).
+# Each scene's frames cycle through the bands in random order, so every scene is seen near,
+# mid-range and far: without that the network learns one preferred distance and compresses
+# depth toward it (DROID wrist views reach past 1 m; SO-101 grasps start at a few cm).
+POSE_BANDS = [
+    (("uniform", 0.04, 0.15), ("normal", 28, 10)),
+    (("uniform", 0.15, 0.40), ("normal", 35, 13)),
+    (("uniform", 0.40, 0.90), ("normal", 45, 15)),
+    (("uniform", 0.90, 2.50), ("uniform", 40, 85)),
+    (("loguniform", 0.04, 2.50), ("uniform", 0, 80)),
 ]
 # Census table surfaces: share, ambientCG name prefixes (None = plain painted colour).
 TABLES = [
@@ -241,14 +241,29 @@ def load_gripper(gdir: Path):
     return spec, parts
 
 
-def gripper_poses(spec, parts, T_world_cam_cv, jaw_cmd, T_mount):
+def gripper_poses(spec, parts, T_world_cam_cv, jaw_cmd, T_mount, scale=1.0, pivot=None):
+    """World matrices of the gripper meshes; ``scale`` resizes the gripper about ``pivot``.
+
+    Scaling about a point on the gripper (not the camera) changes how big the jaws look, so the
+    network cannot use one jaw size as a ruler for absolute distance.
+    """
     jaw = spec["jaw_offset_rad"] + spec["jaw_gain"] * jaw_cmd
     k = int(np.argmin(np.abs(np.array(spec["jaw_grid_rad"]) - jaw)))
+    S = np.eye(4)
+    if pivot is not None and scale != 1.0:
+        S[:3, :3] *= scale
+        S[:3, 3] = (1 - scale) * pivot
     out = []
     for obj, m in parts:
         T = np.array(m["T_cam_cv_from_mesh"][k] if m["moving"] else m["T_cam_cv_from_mesh"])
-        out.append((obj, T_world_cam_cv @ T_mount @ T))
+        out.append((obj, T_world_cam_cv @ T_mount @ S @ T))
     return out
+
+
+def gripper_pivot(spec) -> np.ndarray:
+    """A point on the gripper in the camera frame: the mean origin of its fixed meshes."""
+    fixed = [np.array(m["T_cam_cv_from_mesh"])[:3, 3] for m in spec["meshes"] if not m["moving"]]
+    return np.mean(fixed, axis=0)
 
 
 def mount_variant(rng):
@@ -271,12 +286,11 @@ def mount_variant(rng):
     return T
 
 
-def camera_pose(rng, table_z, look_xy):
+def camera_pose(rng, table_z, look_xy, band):
     """OpenCV camera-to-world with the optical axis hitting the table at look_xy."""
-    w = np.array([m[0] for m in POSE_MIXTURE])
-    comp = POSE_MIXTURE[rng.choice(len(POSE_MIXTURE), p=w / w.sum())]
-    d = draw(rng, comp[1])
-    pitch = np.radians(np.clip(draw(rng, comp[2]), 0, 85))
+    dist_spec, pitch_spec = POSE_BANDS[band]
+    d = draw(rng, dist_spec)
+    pitch = np.radians(np.clip(draw(rng, pitch_spec), 0, 85))
     yaw = rng.uniform(0, 2 * np.pi)
     z_axis = np.array([np.sin(pitch) * np.cos(yaw), np.sin(pitch) * np.sin(yaw), -np.cos(pitch)])
     target = np.array([look_xy[0], look_xy[1], table_z])
@@ -439,6 +453,7 @@ def main() -> None:
     ap.add_argument("--gripper", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--scenes", type=int, default=10)
+    ap.add_argument("--first-scene", type=int, default=0)
     ap.add_argument("--frames-per-scene", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--samples", type=int, default=64)
@@ -466,7 +481,14 @@ def main() -> None:
         map_by=["category_id"], default_values={"category_id": BACKGROUND}
     )
 
-    for scene in range(args.scenes):
+    for scene in range(args.first_scene, args.scenes):
+        # Scenes are seeded independently, so a crashed run resumes by skipping finished scenes.
+        done = (
+            args.out / f"s{args.seed:03d}_{scene:05d}_{i:02d}.npz"
+            for i in range(args.frames_per_scene)
+        )
+        if all(p.exists() for p in done):
+            continue
         rng = np.random.default_rng([args.seed, scene])
         bproc.clean_up(clean_up_camera=True)
         if bpy.context.scene.world is None:
@@ -484,8 +506,17 @@ def main() -> None:
                 else principled("servo", (0.02, 0.02, 0.02), 0.5)
             )
         T_mount = mount_variant(rng)
+        # A quarter of scenes without a gripper in view; the rest with jaws 0.75-1.4x the SO-101
+        # size, log-uniform, so absolute distance cannot be read off the jaw size.
+        show_gripper = rng.random() >= 0.25
+        grip_scale = float(np.exp(rng.uniform(np.log(0.75), np.log(1.4)))) if show_gripper else 1.0
+        pivot = gripper_pivot(spec)
+        for obj, _ in parts:
+            obj.hide(not show_gripper)
+            obj.set_scale([grip_scale] * 3)
 
-        hfov = np.radians(rng.uniform(60, 100))
+        # Wrist cameras range from narrow RealSense-like (55 deg) to wide USB fisheyes (125 deg).
+        hfov = np.radians(rng.uniform(55, 125))
         f = (W / 2) / np.tan(hfov / 2)
         K = np.array(
             [[f, 0, W / 2 + rng.normal(0, 4)], [0, f, H / 2 + rng.normal(0, 4)], [0, 0, 1]]
@@ -494,6 +525,7 @@ def main() -> None:
 
         frames = []
         tries = 0
+        bands = rng.permutation(len(POSE_BANDS))
         while len(frames) < args.frames_per_scene and tries < args.frames_per_scene * 30:
             tries += 1
             if objects and rng.random() < 0.6:
@@ -502,13 +534,13 @@ def main() -> None:
                 c = np.array(
                     [rng.uniform(-size[0] / 2, size[0] / 2), rng.uniform(-size[1] / 2, size[1] / 2)]
                 )
-            T_cv, d = camera_pose(rng, table_z, c)
+            band = int(bands[len(frames) % len(bands)])
+            T_cv, d = camera_pose(rng, table_z, c, band)
             jaw_cmd = 1.48 * rng.beta(1.2, 4.0)
-            poses = gripper_poses(spec, parts, T_cv, jaw_cmd, T_mount)
+            poses = gripper_poses(spec, parts, T_cv, jaw_cmd, T_mount, grip_scale, pivot)
             # Fingers and camera must stay clear of the table surface.
-            if (
-                T_cv[2, 3] < table_z + 0.02
-                or min(lowest_point(o, T) for o, T in poses) < table_z + 0.003
+            if T_cv[2, 3] < table_z + 0.02 or (
+                show_gripper and min(lowest_point(o, T) for o, T in poses) < table_z + 0.003
             ):
                 continue
             if any(inside_box(o, T_cv[:3, 3], 0.01) for o in objects):
@@ -520,9 +552,16 @@ def main() -> None:
             bproc.camera.add_camera_pose(T_gl, frame=frame)
             for obj, T in poses:
                 obj.set_location(T[:3, 3], frame=frame)
-                obj.set_rotation_mat(T[:3, :3], frame=frame)
+                obj.set_rotation_mat(T[:3, :3] / grip_scale, frame=frame)
             frames.append(
-                {"jaw_cmd": float(jaw_cmd), "dist_m": float(d), "T_world_cam_cv": T_cv.tolist()}
+                {
+                    "jaw_cmd": float(jaw_cmd),
+                    "dist_m": float(d),
+                    "band": band,
+                    "gripper": show_gripper,
+                    "gripper_scale": grip_scale,
+                    "T_world_cam_cv": T_cv.tolist(),
+                }
             )
 
         if not frames:

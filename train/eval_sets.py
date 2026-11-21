@@ -23,7 +23,7 @@ from depthpro2_onnx.model import load_model
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import predict_depth, to_input  # noqa: E402
+from common import predict_depth, to_input
 
 ROOT = Path(os.environ.get("WRIST_DEPTH_DATA", "data"))
 # Every n-th DROID frame; training uses a stride to keep periodic scoring cheap.
@@ -138,7 +138,7 @@ SETS = {
 
 @torch.no_grad()
 def evaluate(model, frames) -> dict:
-    ratios, rels, d1s, rels_aligned = [], [], [], []
+    ratios, rels, d1s, rels_aligned, logs = [], [], [], [], []
     for rgb, gt_np, mask_np, f_px in frames:
         if mask_np.sum() < 500:
             continue
@@ -152,8 +152,10 @@ def evaluate(model, frames) -> dict:
         rels.append(float(((p - g).abs() / g).mean()))
         d1s.append(float((torch.maximum(p / g, g / p) < 1.25).float().mean()))
         rels_aligned.append(float(((p / r - g).abs() / g).mean()))
+        logs.append(float((p / g).log().abs().mean()))
     return {
         "frames": len(ratios),
+        "mae_log": float(np.mean(logs)),
         "scale": float(np.median(ratios)),
         "scale_p10_p90": [float(np.percentile(ratios, 10)), float(np.percentile(ratios, 90))],
         "abs_rel": float(np.mean(rels)),

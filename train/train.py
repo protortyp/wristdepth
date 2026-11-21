@@ -27,9 +27,9 @@ from depthpro2_onnx.model import load_model
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common import predict_depth, to_input  # noqa: E402
-from eval_sets import SETS  # noqa: E402
-from eval_sets import evaluate as evaluate_real  # noqa: E402
+from common import predict_depth, to_input
+from eval_sets import SETS
+from eval_sets import evaluate as evaluate_real
 
 
 def crop_resize(rgb, depth, trust, f_px, rng, min_scale=0.6):
@@ -78,7 +78,13 @@ def distill_loss(student, teacher):
     return si + 0.5 * (gx + gy)
 
 
+# Labels outside this range are near-clip gripper slivers or far background; their log error
+# dominates both gradients and mean metrics.
+DEPTH_MIN, DEPTH_MAX = 0.03, 6.0
+
+
 def loss_fn(pred, gt, w):
+    w = w * ((gt > DEPTH_MIN) & (gt < DEPTH_MAX))
     lp, lg = torch.log(pred.clamp_min(1e-4)), torch.log(gt.clamp_min(1e-4))
     diff = (lp - lg) * (w > 0)
     l1 = (diff.abs() * w).sum() / w.sum().clamp_min(1)
@@ -92,7 +98,7 @@ def loss_fn(pred, gt, w):
 
 @torch.no_grad()
 def evaluate(model, files, device, key_depth="depth", key_mask=None) -> dict:
-    rels, ratios, d1 = [], [], []
+    rels, ratios, d1, logs = [], [], [], []
     for f in files:
         z = np.load(f)
         gt = torch.from_numpy(z[key_depth].astype(np.float32)).to(device)
@@ -101,7 +107,7 @@ def evaluate(model, files, device, key_depth="depth", key_mask=None) -> dict:
             if key_mask
             else (torch.from_numpy(z["trust"]).to(device) > 200)
         )
-        mask &= gt > 0
+        mask &= (gt > DEPTH_MIN) & (gt < DEPTH_MAX)
         if mask.sum() < 1000:
             continue
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -111,7 +117,9 @@ def evaluate(model, files, device, key_depth="depth", key_mask=None) -> dict:
         rels.append(((p - g).abs() / g).mean().item())
         ratios.append(r.median().item())
         d1.append((torch.maximum(r, 1 / r) < 1.25).float().mean().item())
+        logs.append(r.float().log().abs().mean().item())
     return {
+        "mae_log": float(np.mean(logs)),
         "abs_rel": float(np.mean(rels)),
         "scale_median": float(np.median(ratios)),
         "delta1": float(np.mean(d1)),
@@ -136,7 +144,8 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=6)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--accum", type=int, default=8)
-    ap.add_argument("--val", type=int, default=300, help="last N synthetic frames for validation")
+    ap.add_argument("--val", type=int, default=300, help="synthetic validation frames (max)")
+    ap.add_argument("--val-scenes", type=int, default=100, help="scenes held out for validation")
     ap.add_argument("--init", type=Path, help="state dict to start from (e.g. stage a result)")
     ap.add_argument(
         "--encoder-blocks",
@@ -153,7 +162,14 @@ def main() -> None:
     device = "cuda"
 
     files = sorted(args.data.glob("*.npz"))
-    train_files, val_files = files[: -args.val], files[-args.val :]
+    # Hold out whole scenes (s{seed}_{scene}_{frame}.npz): frames of one scene share table,
+    # objects and lights, so a frame-level split would leak training scenes into validation.
+    scenes = sorted({f.name.rsplit("_", 1)[0] for f in files})
+    held = set(
+        np.random.default_rng(1234).choice(scenes, min(len(scenes), args.val_scenes), replace=False)
+    )
+    train_files = [f for f in files if f.name.rsplit("_", 1)[0] not in held]
+    val_files = [f for f in files if f.name.rsplit("_", 1)[0] in held][: args.val]
     distill_files = (
         sorted([*args.distill.glob("*.jpg"), *args.distill.glob("*.png")]) if args.distill else []
     )
@@ -189,7 +205,7 @@ def main() -> None:
         opt, max_lr=[g["lr"] for g in groups], total_steps=steps, pct_start=0.05
     )
 
-    ema = None
+    ema, steps_done = None, 0
     if args.ema:
         ema = {k: v.detach().clone().float() for k, v in model.state_dict().items()}
 
@@ -273,9 +289,12 @@ def main() -> None:
                 sched.step()
                 opt.zero_grad(set_to_none=True)
                 if ema is not None:
+                    steps_done += 1
+                    # Warm up the decay so early checkpoints are not mostly the base model.
+                    decay = min(args.ema, (1 + steps_done) / (10 + steps_done))
                     with torch.no_grad():
                         for k, v in model.state_dict().items():
-                            ema[k].mul_(args.ema).add_(v.float(), alpha=1 - args.ema)
+                            ema[k].mul_(decay).add_(v.float(), alpha=1 - decay)
         result = {
             **score(f"epoch {epoch}"),
             "epoch": epoch,

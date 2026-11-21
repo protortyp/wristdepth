@@ -18,9 +18,10 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "synth"))
-from compose import camera_effects  # noqa: E402
+from compose import camera_effects
 
 BACKGROUND = 4
+PINHOLE_SHARE = 0.5
 # Census lens classes: share, k1 range (OpenCV radial model, normalised coordinates).
 LENSES = [(0.10, (-0.05, 0.0)), (0.59, (-0.25, -0.08)), (0.31, (-0.42, -0.25))]
 
@@ -60,6 +61,10 @@ def distort(rgb, depth, seg, K, rng):
     centre focal length, which is what a user would get from calibrating the lens.
     """
     h, w = depth.shape
+    # Half the frames stay pinhole: rectified cameras (RealSense, ZED, calibrated USB) are
+    # common, and the network should see both lens models with consistent f_px.
+    if rng.random() < PINHOLE_SHARE:
+        return rgb, depth, seg, 0.0, float(K[0, 0])
     w_share = np.array([c[0] for c in LENSES])
     k1 = rng.uniform(*LENSES[rng.choice(len(LENSES), p=w_share / w_share.sum())][1])
     dist = np.array([k1, rng.uniform(0, 0.4) * k1**2, 0, 0, 0])
