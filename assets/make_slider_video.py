@@ -74,10 +74,9 @@ for k, (rgb, iv) in enumerate(zip(frames, inv)):
     depth_rgb = (cm.turbo(np.clip((iv - lo) / (hi - lo), 0, 1))[..., :3] * 255).astype(np.uint8)
     a = Image.fromarray(rgb).resize((W, H), Image.Resampling.LANCZOS)
     b = Image.fromarray(depth_rgb).resize((W, H), Image.Resampling.LANCZOS)
-    # Ease in and out so the sweep starts and ends gently.
-    t = k / max(n - 1, 1)
-    t = t * t * (3 - 2 * t)
-    x = int(round(W * (1 - t)))
+    # Constant speed from 90% to 10% of the width: depth shows from the first frame, and the
+    # line crosses the middle at the clip's midpoint.
+    x = int(round(W * (0.9 - 0.8 * k / max(n - 1, 1))))
     canvas = a.copy()
     canvas.paste(b.crop((x, 0, W, H)), (x, 0))
     d = ImageDraw.Draw(canvas)
