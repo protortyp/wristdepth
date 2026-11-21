@@ -38,6 +38,19 @@ def jpeg(array: np.ndarray, quality: int = 95) -> dict:
     return {"bytes": buf.getvalue(), "path": None}
 
 
+# Class ids as a palette PNG: values stay 0-4 for code, viewers show colours. 0 no surface
+# (environment map), 1 gripper, 2 table and flat items, 3 objects, 4 room.
+SEG_PALETTE = [0, 0, 0, 230, 120, 30, 150, 150, 150, 40, 110, 220, 40, 90, 50]
+
+
+def seg_png(ids: np.ndarray) -> dict:
+    img = Image.fromarray(ids.astype(np.uint8), mode="P")
+    img.putpalette(SEG_PALETTE + [0] * (768 - len(SEG_PALETTE)))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return {"bytes": buf.getvalue(), "path": None}
+
+
 def depth_png(depth: np.ndarray) -> dict:
     d = np.where(np.isfinite(depth) & (depth > 0), depth, 0)
     return png(np.clip(np.round(d * DEPTH_SCALE), 0, 65535).astype(np.uint16))
@@ -50,6 +63,8 @@ def split_of(scene: str) -> str:
 
 
 def generator_version(seed: int) -> str:
+    if seed >= 800:
+        return "v5"  # cameras kept inside walls, with more varied dishware
     if seed >= 700:
         return "v4"  # distance bands per scene, wide FOV, jaw-size and gripper-free variation
     if seed >= 600:
@@ -69,7 +84,7 @@ def common(name: str, depth: np.ndarray, seg: np.ndarray, meta: dict) -> dict:
         "frame_index": int(frame),
         "generator_version": generator_version(int(seed[1:])),
         "depth": depth_png(depth),
-        "segmentation": png(seg.astype(np.uint8)),
+        "segmentation": seg_png(seg),
         "camera_to_world": [float(x) for x in np.array(T).ravel()] if T is not None else None,
         "distance_m": float(meta.get("dist_m", np.nan)),
         "gripper_visible": bool(meta.get("gripper", True)),
