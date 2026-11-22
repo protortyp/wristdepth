@@ -26,7 +26,7 @@ Use a rectified RGB image and the horizontal focal length from its camera calibr
 uv run examples/predict_image.py wrist.png --fx-px 557.2
 ```
 
-The first run downloads the model. Inference runs locally on CPU. The example writes `wrist.depth.npy` with camera-axis depth in metres at the original image size, and `wrist.depth.png` with a fixed grayscale range from 5 cm (white) to 1 m (black). It preserves the image aspect ratio and adjusts the focal length when fitting the frame to the model input.
+The first run downloads the model. Inference runs locally on CPU. The example writes `wrist.depth.npy` with camera-axis depth in metres at the original image size, and `wrist.depth.png` with a fixed grayscale range from 5 cm (white) to 1 m (black). Pixels with missing depth are NaN in the metric array and black in the preview. It preserves the image aspect ratio and adjusts the focal length when fitting the frame to the model input.
 
 The default model is v1. For DROID-style wrist views, add `--model christianengel/WristDepth-DROID-preview`. Its model card compares both exported graphs on DROID and the SO-101. The public procedural dataset contains 98,180 Blender frames split by scene. [DROID preview and measured limitations](https://huggingface.co/christianengel/WristDepth-DROID-preview) · [Procedural dataset](https://huggingface.co/datasets/christianengel/WristDepth-procedural)
 
