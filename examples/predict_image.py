@@ -27,8 +27,17 @@ def predict(image: Image.Image, fx_px: float, session: ort.InferenceSession) -> 
     focal = np.asarray([fx_px * resized[0] / image.width], dtype=np.float32)
     depth = session.run(["depth_meters"], {"pixel_values": pixels, "f_px": focal})[0]
     depth = depth.reshape(height, width)[top : top + resized[1], left : left + resized[0]]
+    invalid = ~np.isfinite(depth) | (depth <= 0)
+    if invalid.all():
+        raise ValueError("The model returned no valid depth values")
+    depth = np.where(invalid, np.float32(0), depth)
     original = Image.fromarray(depth).resize(image.size, Image.Resampling.BILINEAR)
-    return np.asarray(original, dtype=np.float32)
+    result = np.array(original, dtype=np.float32)
+    if invalid.any():
+        # A resampled distance needs valid measurements throughout its interpolation footprint.
+        missing = Image.fromarray(invalid.astype(np.float32)).resize(image.size, Image.Resampling.BILINEAR)
+        result[np.asarray(missing) > 0] = np.nan
+    return result
 
 
 def main() -> None:
@@ -55,8 +64,9 @@ def main() -> None:
             graph, sess_options=options, providers=["CPUExecutionProvider"]
         )
         depth = predict(image, args.fx_px, session)
-    if not np.isfinite(depth).all() or (depth <= 0).any():
-        raise ValueError("The model returned invalid depth values")
+    valid = np.isfinite(depth)
+    if not valid.any():
+        raise ValueError("The output image contains no valid depth values")
 
     prefix = args.image.with_suffix("")
     metric_path = prefix.with_name(prefix.name + ".depth.npy")
@@ -64,7 +74,10 @@ def main() -> None:
     np.save(metric_path, depth)
     # The fixed visualization range makes predictions from different images comparable.
     near, far = 0.05, 1.0
-    gray = np.clip(np.log(far / depth) / np.log(far / near), 0, 1)
+    gray = np.zeros_like(depth)
+    gray[valid] = np.clip(np.log(far / depth[valid]) / np.log(far / near), 0, 1)
+    if not valid.all():
+        print(f"{depth.size - valid.sum()} pixels have missing depth (NaN in the metric file).")
     Image.fromarray(np.rint(255 * gray).astype(np.uint8)).save(preview_path)
     print(f"{metric_path} (float32 metres)\n{preview_path} (near is bright)")
 
