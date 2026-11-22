@@ -12,6 +12,7 @@ camera in the gripper frame, plus jaw angle = a + b * commanded angle.
 import json
 import os
 import sys
+from pathlib import Path
 
 import cv2
 import mujoco
@@ -60,22 +61,21 @@ def apply(T0: np.ndarray, x: np.ndarray) -> np.ndarray:
 
 
 def main() -> None:
-    meta = json.load(open(sys.argv[1]))
+    meta = json.loads(Path(sys.argv[1]).read_text())
     fingers, out = sys.argv[2], sys.argv[3]
-    K = np.array(meta["K"]) * np.array([[0.5], [0.5], [1]])
     T0 = np.array(meta["T_gripper_from_cam_cv"])
-    index = json.load(open(f"{fingers}/index.json"))
-    real = [
-        cv2.resize(
-            (cv2.imread(f"{fingers}/{it['file']}", cv2.IMREAD_UNCHANGED)[..., 3] > 0).astype(
-                np.uint8
-            ),
-            (W, H),
-            interpolation=cv2.INTER_NEAREST,
-        )
-        > 0
-        for it in index
-    ]
+    index = json.loads((Path(fingers) / "index.json").read_text())
+    if not index:
+        raise ValueError("At least one gripper sprite is required")
+    masks = [cv2.imread(f"{fingers}/{it['file']}", cv2.IMREAD_UNCHANGED)[..., 3] for it in index]
+    source_height, source_width = masks[0].shape
+    if any(mask.shape != (source_height, source_width) for mask in masks):
+        raise ValueError("All gripper sprites must share one image size")
+    # Older capture metadata omits the calibration size. Its sprites are cut from
+    # the undistorted wrist images on the original calibration pixel grid.
+    calib_width, calib_height = meta.get("size", (source_width, source_height))
+    K = np.diag([W / calib_width, H / calib_height, 1.0]) @ np.asarray(meta["K"])
+    real = [cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST) > 0 for mask in masks]
     rr = SilhouetteRenderer(K)
 
     def ious(x):
@@ -110,16 +110,13 @@ def main() -> None:
         f"rotation {np.degrees(np.linalg.norm(x[:3])):.1f} deg, translation {np.linalg.norm(x[3:6]) * 1000:.1f} mm,"
         f" jaw = {x[6]:+.3f} + {x[7]:.3f} * cmd"
     )
-    json.dump(
-        {
-            "T_gripper_from_cam_cv": apply(T0, x).tolist(),
-            "jaw_offset_rad": x[6],
-            "jaw_gain": x[7],
-            "iou": per.tolist(),
-        },
-        open(out, "w"),
-        indent=1,
-    )
+    result = {
+        "T_gripper_from_cam_cv": apply(T0, x).tolist(),
+        "jaw_offset_rad": x[6],
+        "jaw_gain": x[7],
+        "iou": per.tolist(),
+    }
+    Path(out).write_text(json.dumps(result, indent=1) + "\n")
 
 
 if __name__ == "__main__":
