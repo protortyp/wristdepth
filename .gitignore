@@ -4,3 +4,4 @@ data/
 *.engine
 __pycache__/
 .venv/
+/context.md
